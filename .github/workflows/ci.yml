@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      # --- Shell -----------------------------------------------------------
+
+      - name: Lint shell scripts with shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './docker'
+
+      # --- Dockerfile ------------------------------------------------------
+
+      - name: Lint Dockerfile with hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/Dockerfile
+
+      # --- Docker Compose --------------------------------------------------
+
+      - name: Validate docker-compose.yaml
+        run: docker compose -f docker-compose.yaml config --quiet
+
+      - name: Validate docker-compose.dev.yaml
+        run: docker compose -f docker-compose.dev.yaml config --quiet
+
+      # --- Python ----------------------------------------------------------
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          working-directory: bot
+
+      - name: Check uv.lock is up to date
+        working-directory: bot
+        run: uv lock --check
+
+      - name: Type-check with mypy
+        working-directory: bot
+        run: |
+          uv run --frozen mypy bot.py \
+            --ignore-missing-imports \
+            --strict
+
+      - name: Lint with ruff
+        working-directory: bot
+        run: uv run --frozen ruff check bot.py

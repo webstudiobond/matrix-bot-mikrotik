@@ -1,0 +1,23 @@
+[project]
+name = "matrix-mikrotik-bot"
+version = "1.0.0"
+description = "MikroTik management bot over the Matrix protocol"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32.0",
+    "urllib3>=2.2.0",
+    "PyYAML>=6.0.1",
+    "librouteros>=3.2.1",
+]
+
+[tool.uv]
+# No importable package — bot.py is a standalone script.
+package = false
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10.0",
+    "ruff>=0.4.0",
+    "types-requests>=2.32.0",
+    "types-PyYAML>=6.0.1",
+]

@@ -1,0 +1,118 @@
+name: Build and Publish Docker Image
+
+on:
+  release:
+    types: [published]
+  schedule:
+    # Run at 04:00 UTC every Sunday — catches upstream image updates.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check for upstream updates
+        id: check
+        run: |
+          # Fetch the digest of the base gateway image (our primary dependency).
+          GATEWAY_DIG=$(skopeo inspect \
+            docker://ghcr.io/webstudiobond/matrix-commander-rs-gateway:latest \
+            | jq -r .Digest)
+
+          # Fetch the digest of the uv image (our secondary dependency).
+          UV_DIG=$(skopeo inspect \
+            docker://ghcr.io/astral-sh/uv:latest \
+            | jq -r .Digest)
+
+          echo "gateway_dig=$GATEWAY_DIG" >> "$GITHUB_OUTPUT"
+          echo "uv_dig=$UV_DIG"           >> "$GITHUB_OUTPUT"
+
+          # GHCR requires strict lowercase repository names.
+          IMAGE_BASE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          echo "image_base=$IMAGE_BASE" >> "$GITHUB_OUTPUT"
+
+          # Fetch labels from the currently published latest image.
+          if skopeo inspect "docker://$IMAGE_BASE:latest" > meta.json 2>/dev/null; then
+            OUR_GATEWAY_DIG=$(jq -r '.Labels["org.opencontainers.image.base.digest"] // "none"' meta.json)
+            OUR_UV_DIG=$(jq -r '.Labels["com.webstudiobond.uv.digest"] // "none"' meta.json)
+          else
+            OUR_GATEWAY_DIG="none"
+            OUR_UV_DIG="none"
+          fi
+
+          # Build if: a release was published, upstream changed, or manually dispatched.
+          # schedule-triggered runs only build when an upstream image has actually changed.
+          if [ "${{ github.event_name }}" = "release" ] || \
+             [ "${{ github.event_name }}" = "workflow_dispatch" ] || \
+             [ "$GATEWAY_DIG" != "$OUR_GATEWAY_DIG" ] || \
+             [ "$UV_DIG" != "$OUR_UV_DIG" ]; then
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+            echo "Triggering build."
+          else
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping build: all upstream images are up to date."
+          fi
+
+          # Resolve the version tag:
+          #   release event       → the new Git tag name (e.g. v1.0.0)
+          #   schedule / dispatch → the latest published release tag, so that
+          #                         both :latest and :vX.Y.Z stay in sync when
+          #                         only upstream dependencies changed.
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "version_tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            LATEST_TAG=$(curl -sL \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+              | jq -r '.tag_name // ""')
+            echo "version_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.check.outputs.needs_build == 'true'
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up QEMU
+        if: steps.check.outputs.needs_build == 'true'
+        uses: docker/setup-qemu-action@v3.6.0
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.needs_build == 'true'
+        uses: docker/setup-buildx-action@v3.10.0
+
+      - name: Log in to the Container registry
+        if: steps.check.outputs.needs_build == 'true'
+        uses: docker/login-action@v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch image
+        if: steps.check.outputs.needs_build == 'true'
+        uses: docker/build-push-action@v6.15.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          # Always push :latest. Add the release version tag when available.
+          tags: |
+            ${{ steps.check.outputs.image_base }}:latest
+            ${{ steps.check.outputs.version_tag != '' && format('{0}:{1}', steps.check.outputs.image_base, steps.check.outputs.version_tag) || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=MikroTik management bot over the Matrix protocol
+            org.opencontainers.image.version=${{ steps.check.outputs.version_tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.base.digest=${{ steps.check.outputs.gateway_dig }}
+            com.webstudiobond.uv.digest=${{ steps.check.outputs.uv_dig }}

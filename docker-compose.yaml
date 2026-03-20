@@ -1,0 +1,42 @@
+services:
+  matrix-bot-mikrotik:
+    image: ghcr.io/webstudiobond/matrix-bot-mikrotik:latest
+    build:
+      context: https://github.com/webstudiobond/matrix-bot-mikrotik.git#main
+      dockerfile: docker/Dockerfile
+      args:
+        TARGETARCH: ${TARGETARCH:-amd64}
+    container_name: matrix-bot-mikrotik
+    hostname: matrix-bot-mikrotik
+    restart: unless-stopped
+    environment:
+      # Set to "true" to allow write (add/set) operations via the RouterOS API.
+      # Default is false — the bot operates in read-only mode.
+      ALLOW_WRITES: ${ALLOW_WRITES:-false}
+    healthcheck:
+      # Verify the bot process is alive by checking the Python venv binary.
+      test: ["CMD", "pgrep", "-f", "bot.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      # bot.py may write temporary files here.
+      - /tmp:mode=1777,noexec,nosuid
+    volumes:
+      # Persistent Matrix session database.
+      # Host directory must be owned by UID 10001.
+      - ./bot_data:/home/bot/.local/share/matrix-commander-rs
+      # Router credentials — read-only.
+      # Host file must be owned by UID 10001; permissions: 0600.
+      - ./config.yaml:/home/bot/config/config.yaml:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add: []
+    cpus: 0.5
+    mem_limit: 192m
+    mem_reservation: 64m

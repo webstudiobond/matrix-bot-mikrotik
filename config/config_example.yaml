@@ -1,0 +1,105 @@
+# config/config_example.yaml — example configuration
+#
+# Copy to the project root, rename to config.yaml, then:
+#   sudo chown 10001:10001 config.yaml
+#   chmod 0600 config.yaml
+#
+# NEVER commit a file containing real credentials to version control.
+
+# =============================================================================
+# Security
+# =============================================================================
+
+# Full Matrix user ID of the bot account itself.
+# Used to ignore the bot's own messages and prevent feedback loops.
+bot_user: "@mikrotik-bot:your.homeserver"
+
+# Matrix room ID where the bot listens for and executes commands.
+command_room: "!yourRoomId:your.homeserver"
+
+# Matrix room ID for security alerts only.
+# Unauthorized access notifications are sent here.
+# This room does NOT accept commands — it is write-only for the bot.
+# Must be different from command_room and accessible only to administrators.
+admin_room: "!adminRoomId:your.homeserver"
+
+# Full Matrix user IDs allowed to issue commands.
+# Any message from a user NOT in this list triggers an alert to admin_room.
+allowed_users:
+  - "@admin:your.homeserver"
+  - "@engineer:your.homeserver"
+
+# =============================================================================
+# Command whitelist
+# =============================================================================
+# RouterOS API paths the bot is allowed to execute (read-only by default).
+# Paths follow the same slash-separated format used in bot commands.
+# Add or remove entries to control what operators can query.
+# Write paths (those used with =key=value params) are gated by ALLOW_WRITES
+# env var independently — listing them here only permits the read (GET) form
+# unless ALLOW_WRITES=true is also set.
+#
+# API documentation:
+#   REST API (RouterOS 7.1+): https://help.mikrotik.com/docs/display/ROS/REST+API
+#   RouterOS API (all versions): https://help.mikrotik.com/docs/display/ROS/API
+
+allowed_commands:
+  - "system/resource"
+  - "system/identity"
+  - "system/clock"
+  - "system/routerboard"
+  - "ip/address"
+  - "ip/route"
+  - "ip/dns"
+  - "ip/dns/static"
+  - "ip/dhcp-server/lease"
+  - "ip/firewall/filter"
+  - "ip/firewall/nat"
+  - "ip/firewall/connection"
+  - "interface"
+  - "interface/ethernet"
+  - "interface/wireless/registration-table"
+  - "routing/bgp/peer"
+  - "routing/ospf/neighbor"
+
+# =============================================================================
+# Routers
+# =============================================================================
+# Transport is selected automatically by port number:
+#   port 443 / 80   → RouterOS REST API (HTTPS/HTTP) — RouterOS 7.1+
+#   port 8729       → RouterOS API over TLS           — RouterOS 6.x+
+#   port 8728       → RouterOS API plaintext          — RouterOS 3.x+
+
+routers:
+
+  # RouterOS 7.1+ — REST API over HTTPS, valid CA-signed certificate
+  core-01:
+    host: "192.168.88.1"
+    port: 443
+    username: "api-bot"
+    password: "strong-random-password"
+    tls_verify: true
+
+  # RouterOS 7.1+ — REST API over HTTPS, self-signed certificate
+  branch-02:
+    host: "10.0.1.1"
+    port: 443
+    username: "api-bot"
+    password: "another-strong-password"
+    tls_verify: false
+
+  # RouterOS 6.x — RouterOS API over TLS (librouteros)
+  office-03:
+    host: "10.10.0.1"
+    port: 8729
+    username: "api-bot"
+    password: "yet-another-password"
+    tls_verify: false
+
+  # RouterOS 3.x / 4.x / 5.x / 6.x — RouterOS API plaintext (librouteros)
+  legacy-04:
+    host: "172.16.5.1"
+    port: 8728
+    username: "admin"
+    password: "old-password"
+    tls_verify: false
