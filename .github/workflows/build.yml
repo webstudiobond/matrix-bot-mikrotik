@@ -11,81 +11,39 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  check-and-build:
+  docker:
+    name: Build Docker
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Check for upstream updates
-        id: check
-        run: |
-          GATEWAY_DIG=$(skopeo inspect \
-            docker://ghcr.io/underhax/matrix-cli:latest \
-            | jq -r .Digest)
-
-          UV_DIG=$(skopeo inspect \
-            docker://ghcr.io/astral-sh/uv:latest \
-            | jq -r .Digest)
-
-          echo "gateway_dig=$GATEWAY_DIG" >> "$GITHUB_OUTPUT"
-          echo "uv_dig=$UV_DIG"           >> "$GITHUB_OUTPUT"
-
-          IMAGE_BASE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
-          echo "image_base=$IMAGE_BASE" >> "$GITHUB_OUTPUT"
-
-          if skopeo inspect "docker://$IMAGE_BASE:latest" > meta.json 2>/dev/null; then
-            OUR_GATEWAY_DIG=$(jq -r '.Labels["org.opencontainers.image.base.digest"] // "none"' meta.json)
-            OUR_UV_DIG=$(jq -r '.Labels["com.underhax.uv.digest"] // "none"' meta.json)
-          else
-            OUR_GATEWAY_DIG="none"
-            OUR_UV_DIG="none"
-          fi
-
-          if [ "${{ github.event_name }}" = "release" ] || \
-             [ "${{ github.event_name }}" = "workflow_dispatch" ] || \
-             [ "$GATEWAY_DIG" != "$OUR_GATEWAY_DIG" ] || \
-             [ "$UV_DIG" != "$OUR_UV_DIG" ]; then
-            echo "needs_build=true" >> "$GITHUB_OUTPUT"
-            echo "Triggering build."
-          else
-            echo "needs_build=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping build: all upstream images are up to date."
-          fi
-
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "version_tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          else
-            LATEST_TAG=$(curl -sL \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-              | jq -r '.tag_name // ""')
-            echo "version_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Checkout repository
-        if: steps.check.outputs.needs_build == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up QEMU
-        if: steps.check.outputs.needs_build == 'true'
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Set up Docker Buildx
-        if: steps.check.outputs.needs_build == 'true'
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to the Container registry
-        if: steps.check.outputs.needs_build == 'true'
         uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract matrix-cli version
+        id: version
+        run: |
+          MATRIX_CLI_VERSION=$(sed -n 's/^FROM ghcr.io\/underhax\/matrix-cli:\([^@ ]*\)@.*/\1/p' docker/Dockerfile)
+          test -n "$MATRIX_CLI_VERSION"
+          echo "value=$MATRIX_CLI_VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Build and push multi-arch image
-        if: steps.check.outputs.needs_build == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -93,15 +51,11 @@ jobs:
           push: true
           provenance: false
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ steps.check.outputs.image_base }}:latest
-            ${{ steps.check.outputs.version_tag != '' && format('{0}:{1}', steps.check.outputs.image_base, steps.check.outputs.version_tag) || '' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.value }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=MikroTik management bot over the Matrix protocol
-            org.opencontainers.image.version=${{ steps.check.outputs.version_tag }}
+            org.opencontainers.image.version=${{ steps.version.outputs.value }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.base.digest=${{ steps.check.outputs.gateway_dig }}
-            com.underhax.uv.digest=${{ steps.check.outputs.uv_dig }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
