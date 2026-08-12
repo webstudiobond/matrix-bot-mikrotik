@@ -1,12 +1,10 @@
 name: Build and Publish Docker Image
 
 on:
-  release:
-    types: [published]
-  schedule:
-    # Run at 04:00 UTC every Sunday — catches upstream image updates.
-    - cron: '0 4 * * 0'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
@@ -23,12 +21,10 @@ jobs:
       - name: Check for upstream updates
         id: check
         run: |
-          # Fetch the digest of the base gateway image (our primary dependency).
           GATEWAY_DIG=$(skopeo inspect \
-            docker://ghcr.io/underhax/matrix-commander-rs-gateway:latest \
+            docker://ghcr.io/underhax/matrix-cli:latest \
             | jq -r .Digest)
 
-          # Fetch the digest of the uv image (our secondary dependency).
           UV_DIG=$(skopeo inspect \
             docker://ghcr.io/astral-sh/uv:latest \
             | jq -r .Digest)
@@ -36,11 +32,9 @@ jobs:
           echo "gateway_dig=$GATEWAY_DIG" >> "$GITHUB_OUTPUT"
           echo "uv_dig=$UV_DIG"           >> "$GITHUB_OUTPUT"
 
-          # GHCR requires strict lowercase repository names.
           IMAGE_BASE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
           echo "image_base=$IMAGE_BASE" >> "$GITHUB_OUTPUT"
 
-          # Fetch labels from the currently published latest image.
           if skopeo inspect "docker://$IMAGE_BASE:latest" > meta.json 2>/dev/null; then
             OUR_GATEWAY_DIG=$(jq -r '.Labels["org.opencontainers.image.base.digest"] // "none"' meta.json)
             OUR_UV_DIG=$(jq -r '.Labels["com.underhax.uv.digest"] // "none"' meta.json)
@@ -49,8 +43,6 @@ jobs:
             OUR_UV_DIG="none"
           fi
 
-          # Build if: a release was published, upstream changed, or manually dispatched.
-          # schedule-triggered runs only build when an upstream image has actually changed.
           if [ "${{ github.event_name }}" = "release" ] || \
              [ "${{ github.event_name }}" = "workflow_dispatch" ] || \
              [ "$GATEWAY_DIG" != "$OUR_GATEWAY_DIG" ] || \
@@ -62,11 +54,6 @@ jobs:
             echo "Skipping build: all upstream images are up to date."
           fi
 
-          # Resolve the version tag:
-          #   release event       → the new Git tag name (e.g. v1.0.0)
-          #   schedule / dispatch → the latest published release tag, so that
-          #                         both :latest and :vX.Y.Z stay in sync when
-          #                         only upstream dependencies changed.
           if [ "${{ github.event_name }}" = "release" ]; then
             echo "version_tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
           else
@@ -79,19 +66,19 @@ jobs:
 
       - name: Checkout repository
         if: steps.check.outputs.needs_build == 'true'
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up QEMU
         if: steps.check.outputs.needs_build == 'true'
-        uses: docker/setup-qemu-action@v4.0.0
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Set up Docker Buildx
         if: steps.check.outputs.needs_build == 'true'
-        uses: docker/setup-buildx-action@v4.0.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to the Container registry
         if: steps.check.outputs.needs_build == 'true'
-        uses: docker/login-action@v4.0.0
+        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -99,13 +86,13 @@ jobs:
 
       - name: Build and push multi-arch image
         if: steps.check.outputs.needs_build == 'true'
-        uses: docker/build-push-action@v7.0.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: docker/Dockerfile
           push: true
+          provenance: false
           platforms: linux/amd64,linux/arm64
-          # Always push :latest. Add the release version tag when available.
           tags: |
             ${{ steps.check.outputs.image_base }}:latest
             ${{ steps.check.outputs.version_tag != '' && format('{0}:{1}', steps.check.outputs.image_base, steps.check.outputs.version_tag) || '' }}
@@ -116,3 +103,5 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.base.digest=${{ steps.check.outputs.gateway_dig }}
             com.underhax.uv.digest=${{ steps.check.outputs.uv_dig }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -5,57 +5,61 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  lint:
+  python:
+    name: Python checks
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # --- Shell -----------------------------------------------------------
+      - name: Install uv
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+
+      - name: Check uv.lock is up to date
+        run: uv lock --check
+
+      - name: Install project dependencies
+        run: uv sync --locked
+
+      - name: Run project verification
+        run: make verify
+
+  trivy:
+    name: Trivy Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+  docker-lint:
+    name: Docker checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Lint shell scripts with shellcheck
-        uses: ludeeus/action-shellcheck@2.0.0
-        with:
-          scandir: './docker'
-
-      # --- Dockerfile ------------------------------------------------------
+        run: shellcheck docker/*.sh
 
       - name: Lint Dockerfile with hadolint
-        uses: hadolint/hadolint-action@v3.3.0
-        with:
-          dockerfile: docker/Dockerfile
-
-      # --- Docker Compose --------------------------------------------------
+        run: docker run --rm -i hadolint/hadolint < docker/Dockerfile
 
       - name: Validate docker-compose.yaml
         run: docker compose -f docker-compose.yaml config --quiet
 
       - name: Validate docker-compose.dev.yaml
         run: docker compose -f docker-compose.dev.yaml config --quiet
-
-      # --- Python ----------------------------------------------------------
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7.6.0
-        with:
-          working-directory: bot
-
-      - name: Check uv.lock is up to date
-        working-directory: bot
-        run: uv lock --check
-
-      - name: Type-check with mypy
-        working-directory: bot
-        run: |
-          uv run --frozen mypy bot.py \
-            --ignore-missing-imports \
-            --strict
-
-      - name: Lint with ruff
-        working-directory: bot
-        run: uv run --frozen ruff check bot.py

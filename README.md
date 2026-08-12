@@ -1,12 +1,12 @@
 # MikroTik Matrix Bot
 
 [![CI](https://github.com/underhax/matrix-bot-mikrotik/actions/workflows/ci.yml/badge.svg)](https://github.com/underhax/matrix-bot-mikrotik/actions/workflows/ci.yml)
-[![GitHub last commit](https://img.shields.io/github/last-commit/underhax/matrix-commander-rs-gateway)](https://github.com/underhax/matrix-bot-mikrotik/commits/main)
-[![GitHub issues](https://img.shields.io/github/issues/underhax/matrix-commander-rs-gateway)](https://github.com/underhax/matrix-bot-mikrotik/issues)
-[![GitHub repo size](https://img.shields.io/github/repo-size/underhax/matrix-commander-rs-gateway)](https://github.com/underhax/matrix-bot-mikrotik)
+[![GitHub last commit](https://img.shields.io/github/last-commit/underhax/matrix-cli)](https://github.com/underhax/matrix-bot-mikrotik/commits/main)
+[![GitHub issues](https://img.shields.io/github/issues/underhax/matrix-cli)](https://github.com/underhax/matrix-bot-mikrotik/issues)
+[![GitHub repo size](https://img.shields.io/github/repo-size/underhax/matrix-cli)](https://github.com/underhax/matrix-bot-mikrotik)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A containerised MikroTik management bot that bridges Matrix rooms to MikroTik routers. Extends the [`matrix-commander-rs-gateway`](https://github.com/underhax/matrix-commander-rs-gateway) base image and supports the full range of deployed MikroTik hardware.
+A containerised MikroTik management bot that bridges Matrix rooms to MikroTik routers. Extends the [`matrix-cli`](https://github.com/underhax/matrix-cli) base image and supports the full range of deployed MikroTik hardware.
 
 ---
 
@@ -35,7 +35,7 @@ A containerised MikroTik management bot that bridges Matrix rooms to MikroTik ro
 │  Container (UID 10001, read-only rootfs)                     │
 │                                                              │
 │  PID 1: mikrotik_entrypoint.sh                               │
-│   └── python3 bot.py   →  matrix-commander-rs listener       │
+│   └── python3 bot.py   →  matrix-cli listener                │
 │                                │                             │
 │                     ┌──────────┴──────────┐                  │
 │                     ▼                     ▼                  │
@@ -73,8 +73,9 @@ The bot selects the router communication protocol automatically based on the `po
 │       └── build.yml           # build and publish image on release / schedule
 ├── bot/
 │   ├── bot.py                  # bot application logic
-│   ├── pyproject.toml          # Python dependencies
-│   └── uv.lock                 # locked dependency manifest — commit this
+│   └── tests/                  # unit tests
+├── pyproject.toml              # Python dependencies and tooling
+├── uv.lock                     # locked dependency manifest — commit this
 ├── config/
 │   └── routers_example.yaml    # copy to project root, rename to config.yaml, fill in, keep out of git
 ├── docker/
@@ -94,8 +95,13 @@ The bot selects the router communication protocol automatically based on the `po
 |------|----------------|
 | Docker Engine | 24.x (BuildKit enabled) |
 | Docker Compose | v2.x |
+| Python | 3.14+ (development only) |
+| uv | latest stable (development only) |
+| GNU Make | development only |
+| direnv | optional (development only) |
 
-No tools beyond Docker are required to run the pre-built image.
+No tools beyond Docker are required to run the pre-built image. Python, uv,
+Make, and direnv are only needed for local development and checks.
 
 ---
 
@@ -301,47 +307,17 @@ Port 8728 is enabled by default. No additional setup required.
 
 ---
 
-## Building Locally (development)
+## Development
 
-Clone the repository and build the image with the dev compose file.
-The build context is the repository root; `docker/Dockerfile` is referenced explicitly.
-
-### Generate uv.lock
-
-`uv.lock` must exist in `bot/` before building. If you have `uv` installed locally:
-
-```bash
-cd bot && uv lock && cd ..
-```
-
-Or without installing anything on the host:
-
-```bash
-docker run --rm -v "$(pwd)/bot:/work" -w /work ghcr.io/astral-sh/uv:latest uv lock
-```
-
-Commit `uv.lock` to version control. The Docker build uses `--frozen` and
-fails loudly if the lockfile is absent or out of sync with `pyproject.toml`.
-Re-run `uv lock` whenever `pyproject.toml` changes.
-
-### Build
-
-```bash
-# amd64 (default)
-docker compose -f docker-compose.dev.yaml build
-
-# arm64 (e.g. Raspberry Pi 4, Apple Silicon server)
-TARGETARCH=arm64 docker compose -f docker-compose.dev.yaml build
-
-# Force full rebuild (after base image update)
-docker compose -f docker-compose.dev.yaml build --no-cache
-```
+The complete local setup, dependency management, formatting, linting, type
+checking, testing, `direnv`, and Docker development workflow is documented in
+[`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ---
 
 ## Matrix Session Login
 
-The bot uses `matrix-commander-rs` for all Matrix communication. A session must be created once before the first start. The session is persisted in `bot_data/` and reused on every subsequent start.
+The bot uses `matrix-cli` for all Matrix communication. A session must be created once before the first start. The session is persisted in `bot_data/` and reused on every subsequent start.
 
 ### Step 1 — Create a dedicated bot account
 
@@ -364,36 +340,24 @@ docker compose exec -it matrix-bot-mikrotik /bin/bash
 ### Step 4 — Run the initial login
 
 Inside the container
-([full CLI reference](https://github.com/8go/matrix-commander-rs?tab=readme-ov-file#usage)):
+([full CLI reference](https://github.com/underhax/matrix-cli#usage)):
 
 ```bash
-matrix-commander-rs --login password \
-  --homeserver "https://your.homeserver" \
-  --user-login "@mikrotik-bot:your.homeserver" \
-  --device "MikroTik Bot" \
-  --password "YourStr0ng-Pa$$word" \
-  --room-default "!yourRoomId:your.homeserver"
+matrix-cli --mode auth --server "matrix.org" --user "@mikrotik-bot:matrix.org"
 ```
 
 Session credentials are written to `bot_data/` on the host and persist across container restarts.
 
 ### Step 5 — Device verification (cross-signing)
 
-After login, verify the bot device and your personal device to establish cross-signing trust. Run both commands inside the container:
+After login, you need to establish E2EE trust. You can generate cross-signing keys or start a verification flow. Inside the container:
 
 ```bash
-# Verify the bot's own device
-matrix-commander-rs --verify emoji-req \
-  --user "@mikrotik-bot:your.homeserver" \
-  --device "DEVICEIDHERE"
-
-# Verify your personal device
-matrix-commander-rs --verify emoji-req \
-  --user "@you:your.homeserver" \
-  --device "YOURDEVICEID"
+# Verify with another user session interactively:
+matrix-cli --mode verify --user "@you:your.homeserver"
 ```
 
-Device IDs are printed in the console output during the login step. For full verification details see the [upstream documentation](https://github.com/8go/matrix-commander-rs?tab=readme-ov-file#usage).
+For full verification details see the [upstream documentation](https://github.com/underhax/matrix-cli#usage).
 
 ### Step 6 — Exit and restart
 
@@ -564,7 +528,7 @@ docker compose logs -f | grep -iE "error|warn|critical"
 The lockfile is missing or out of sync with `pyproject.toml`. Regenerate it:
 
 ```bash
-cd bot && uv lock && cd ..
+uv lock
 docker compose -f docker-compose.dev.yaml build --no-cache
 ```
 

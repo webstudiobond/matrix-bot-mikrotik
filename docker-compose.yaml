@@ -28,7 +28,7 @@ services:
     volumes:
       # Persistent Matrix session database.
       # Host directory must be owned by UID 10001.
-      - ./bot_data:/home/bot/.local/share/matrix-commander-rs
+      - ./bot_data:/home/bot/.config/matrix-cli
       # Router credentials — read-only.
       # Host file must be owned by UID 10001; permissions: 0600.
       - ./config.yaml:/home/bot/config/config.yaml:ro

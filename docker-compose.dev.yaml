@@ -21,7 +21,7 @@ services:
     tmpfs:
       - /tmp:mode=1777,noexec,nosuid
     volumes:
-      - ./bot_data:/home/bot/.local/share/matrix-commander-rs
+      - ./bot_data:/home/bot/.config/matrix-cli
       - ./config.yaml:/home/bot/config/config.yaml:ro
     security_opt:
       - no-new-privileges:true

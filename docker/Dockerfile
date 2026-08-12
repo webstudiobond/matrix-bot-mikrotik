@@ -22,7 +22,7 @@ FROM ghcr.io/astral-sh/uv:latest AS uv-bin
 
 # --- Stage 2: final runtime image ----------------------------------------
 # hadolint ignore=DL3007
-FROM ghcr.io/underhax/matrix-commander-rs-gateway:latest
+FROM ghcr.io/underhax/matrix-cli:latest
 
 USER root
 
@@ -38,7 +38,7 @@ COPY --from=uv-bin /uv /usr/local/bin/uv
 # Copy dependency manifests before application source to exploit layer cache:
 # uv sync reruns only when pyproject.toml or uv.lock change.
 WORKDIR /home/bot/app
-COPY bot/pyproject.toml bot/uv.lock ./
+COPY pyproject.toml uv.lock ./
 
 # Sync dependencies into a fixed venv path.
 #   UV_PROJECT_ENVIRONMENT : instructs uv to create and use the venv at this

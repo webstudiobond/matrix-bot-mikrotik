@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""
-bot/bot.py — MikroTik Matrix Gateway Bot
+"""MikroTik Matrix Gateway Bot.
 
-Listens for Matrix messages produced by matrix-commander-rs (``--listen
-forever --output json``), parses commands of the form:
+Listens for Matrix messages produced by matrix-cli (``--mode listen
+--json``), parses commands of the form:
 
     !mtik <router_id> <command>
 
@@ -52,131 +51,115 @@ import logging
 import os
 import re
 import signal
-import subprocess
+import ssl
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, NoReturn, cast
+
+if TYPE_CHECKING:
+    from types import FrameType
 
 import librouteros
-import librouteros.query
+import librouteros.exceptions
 import requests
 import urllib3
 import yaml
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+from bot._matrix_cli import send_message, start_listener
 
 CONFIG_PATH: Path = Path(os.getenv("ROUTERS_CONFIG", "/home/bot/config/config.yaml"))
-MC_BIN: str = "/usr/local/bin/matrix-commander-rs"
 
-# Matches: !mtik <router_id> <command_and_args>
-#   router_id : 1–64 chars, alphanumeric / hyphen / underscore.
-#   command   : 1–512 printable ASCII chars (no control chars).
 CMD_RE: re.Pattern[str] = re.compile(
     r"^!mtik\s+(?P<router_id>[A-Za-z0-9_-]{1,64})\s+(?P<command>[\x20-\x7E]{1,512})$"
 )
 
-# Ports that indicate the RouterOS REST API transport.
 REST_PORTS: frozenset[int] = frozenset({80, 443})
 
-# Port that indicates RouterOS API over TLS (librouteros).
 ROUTEROS_API_TLS_PORT: int = 8729
+ROUTEROS_REST_HTTPS_PORT: int = 443
+HTTP_UNAUTHORIZED: int = 401
+MAX_MESSAGE_LENGTH: int = 4000
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, stream=sys.stdout)
 log = logging.getLogger("matrix-mikrotik-bot")
 
-# ---------------------------------------------------------------------------
-# Types
-# ---------------------------------------------------------------------------
 
-RouterConfig = dict[str, Any]
+RouterConfig = dict[str, object]
 RoutersMap = dict[str, RouterConfig]
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-
+@dataclass(frozen=True)
 class BotConfig:
     """Holds the full validated configuration loaded from config.yaml."""
 
-    def __init__(
-        self,
-        bot_user: str,
-        command_room: str,
-        admin_room: str,
-        allowed_users: list[str],
-        allowed_commands: list[str],
-        routers: RoutersMap,
-    ) -> None:
-        self.bot_user = bot_user
-        self.command_room = command_room
-        self.admin_room = admin_room
-        self.allowed_users = allowed_users
-        self.allowed_commands = allowed_commands
-        self.routers = routers
+    bot_user: str
+    command_room: str
+    admin_room: str
+    allowed_users: list[str]
+    allowed_commands: list[str]
+    routers: RoutersMap
 
 
-def load_config(path: Path) -> BotConfig:
-    """Load and validate the full configuration from config.yaml.
+def validate_top_level(
+    raw: dict[str, object],
+) -> tuple[str, str, str, list[str], list[str]]:
+    """Validate top-level ``bot_user``, ``command_room``, ``admin_room`` fields.
 
-    Parameters
-    ----------
-    path:
-        Filesystem path to the YAML configuration file.
+    Args:
+        raw: Mapping of top-level config keys to their parsed values.
 
-    Returns
-    -------
-    BotConfig
-        Fully validated configuration object.
+    Returns:
+        Tuple of ``(bot_user, command_room, admin_room, allowed_users,
+        allowed_commands)`` ready to be packed into ``BotConfig``.
 
-    Raises
-    ------
-    SystemExit
-        On missing file, YAML parse failure, or schema violation.
     """
-    if not path.exists():
-        log.critical("Config file not found: %s", path)
-        sys.exit(1)
-
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
-        log.critical("YAML parse error in %s: %s", path, exc)
-        sys.exit(1)
-
-    if not raw:
-        log.critical("Config file is empty: %s", path)
-        sys.exit(1)
-
-    # --- required top-level security fields ---
     for field in ("bot_user", "command_room", "admin_room"):
         if not raw.get(field):
             log.critical("Missing required config field: %r", field)
             sys.exit(1)
 
-    allowed_users: list[str] = raw.get("allowed_users", [])
+    allowed_users = cast("list[str]", raw.get("allowed_users", []))
     if not allowed_users:
         log.critical("allowed_users must contain at least one Matrix user ID")
         sys.exit(1)
 
-    allowed_commands: list[str] = raw.get("allowed_commands", [])
+    allowed_commands = cast("list[str]", raw.get("allowed_commands", []))
     if not allowed_commands:
         log.critical("allowed_commands must contain at least one path")
         sys.exit(1)
 
-    # --- validate allowed_commands entries ---
     for cmd in allowed_commands:
         if not re.fullmatch(r"[A-Za-z0-9/_-]+", cmd):
-            log.critical("Invalid allowed_commands entry %r: must match [A-Za-z0-9/_-]+", cmd)
+            log.critical(
+                "Invalid allowed_commands entry %r: must match [A-Za-z0-9/_-]+",
+                cmd,
+            )
             sys.exit(1)
 
-    # --- routers ---
-    routers: dict[str, Any] = (raw or {}).get("routers", {})
+    return (
+        str(raw["bot_user"]),
+        str(raw["command_room"]),
+        str(raw["admin_room"]),
+        allowed_users,
+        allowed_commands,
+    )
+
+
+def validate_routers(raw: dict[str, object], path: Path) -> RoutersMap:
+    """Validate the ``routers`` section of the configuration.
+
+    Args:
+        raw: Top-level config mapping.
+        path: Path to the YAML file, used for log messages.
+
+    Returns:
+        Mapping of ``router_id`` to its validated configuration dict.
+
+    """
+    routers = cast("dict[str, RouterConfig]", raw.get("routers", {}))
     if not routers:
         log.critical("No routers defined in %s", path)
         sys.exit(1)
@@ -190,71 +173,95 @@ def load_config(path: Path) -> BotConfig:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", rid):
             log.critical("Invalid router_id %r: must match [A-Za-z0-9_-]{1,64}", rid)
             sys.exit(1)
+    return routers
+
+
+def load_config(path: Path) -> BotConfig:
+    """Load and validate the full configuration from config.yaml.
+
+    Validates all required fields, allowed lists, and router parameters.
+    Exits the process (sys.exit) if any validation fails.
+    """
+    if not path.is_file():
+        log.critical("Config file not found: %s", path)
+        sys.exit(1)
+
+    try:
+        loaded: dict[str, object] | list[object] | str | int | float | bool | None
+        loaded = cast(
+            "dict[str, object] | list[object] | str | int | float | bool | None",
+            yaml.safe_load(path.read_text(encoding="utf-8")),
+        )
+    except yaml.YAMLError as exc:
+        log.critical("YAML parse error in %s: %s", path, exc)
+        sys.exit(1)
+
+    if not isinstance(loaded, dict):
+        log.critical("Config file is empty or invalid: %s", path)
+        sys.exit(1)
+
+    raw: dict[str, object] = loaded
+
+    bot_user, command_room, admin_room, allowed_users, allowed_commands = (
+        validate_top_level(raw)
+    )
+    routers = validate_routers(raw, path)
 
     log.info("Loaded %d router(s): %s", len(routers), sorted(routers.keys()))
     log.info("Allowed users: %s", allowed_users)
     log.info("Allowed commands: %d paths", len(allowed_commands))
 
     return BotConfig(
-        bot_user=raw["bot_user"],
-        command_room=raw["command_room"],
-        admin_room=raw["admin_room"],
+        bot_user=bot_user,
+        command_room=command_room,
+        admin_room=admin_room,
         allowed_users=allowed_users,
         allowed_commands=allowed_commands,
         routers=routers,
     )
 
 
-# ---------------------------------------------------------------------------
-# Transport: RouterOS REST API (RouterOS 7.1+, ports 80/443)
-# ---------------------------------------------------------------------------
-
-
 class RouterOSError(Exception):
     """Raised when any router transport returns an error or is unreachable."""
 
 
-def _rest_session(cfg: RouterConfig) -> requests.Session:
+def rest_session(cfg: RouterConfig) -> requests.Session:
     """Build an authenticated requests.Session for the RouterOS REST API."""
     session = requests.Session()
-    session.auth = (cfg["username"], cfg["password"])
-    verify: bool = cfg.get("tls_verify", True)
+    session.auth = (cast("str", cfg["username"]), cast("str", cfg["password"]))
+    verify = cast("bool", cfg.get("tls_verify", True))
     session.verify = verify
     if not verify:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return session
 
 
-def _parse_ros_kv(raw: str) -> dict[str, str]:
+def parse_ros_kv(raw: str) -> dict[str, str]:
     """Parse RouterOS =key=value token pairs into a plain dict.
 
-    Parameters
-    ----------
-    raw:
-        String of the form ``=address=10.0.0.1/24 =interface=ether1``.
+    Args:
+        raw: String of the form ``=address=10.0.0.1/24 =interface=ether1``.
+
+    Returns:
+        Mapping of key → value extracted from ``=key=value`` tokens.
+
     """
-    return {k: v for k, v in re.findall(r"=([^=\s]+)=([^\s]*)", raw)}
+    return dict(re.findall(r"=([^=\s]+)=([^\s]*)", raw))
 
 
 def execute_rest(cfg: RouterConfig, raw_command: str) -> str:
     """Execute a command via the RouterOS REST API (RouterOS 7.1+).
 
-    Parameters
-    ----------
-    cfg:
-        Router configuration dict.
-    raw_command:
-        Validated command string from the Matrix message.
+    Args:
+        cfg: Router configuration dict.
+        raw_command: Validated command string from the Matrix message.
 
-    Returns
-    -------
-    str
+    Returns:
         JSON-formatted result, truncated to 4 000 chars.
 
-    Raises
-    ------
-    RouterOSError
-        On connection failure, auth error, or non-2xx response.
+    Raises:
+        RouterOSError: On connection failure, auth error, or non-2xx response.
+
     """
     allow_writes: bool = os.getenv("ALLOW_WRITES", "false").lower() == "true"
 
@@ -262,93 +269,92 @@ def execute_rest(cfg: RouterConfig, raw_command: str) -> str:
     api_path = parts[0].strip("/")
 
     if not re.fullmatch(r"[A-Za-z0-9/_-]+", api_path):
-        raise RouterOSError(f"Invalid API path: {api_path!r}")
+        msg = f"Invalid API path: {api_path!r}"
+        raise RouterOSError(msg)
 
-    tls: bool = cfg.get("tls_verify", True)
-    scheme = "https" if (tls or cfg["port"] == 443) else "http"
+    tls = cast("bool", cfg.get("tls_verify", True))
+    scheme = "https" if (tls or cfg["port"] == ROUTEROS_REST_HTTPS_PORT) else "http"
     url = f"{scheme}://{cfg['host']}:{cfg['port']}/rest/{api_path}"
 
-    session = _rest_session(cfg)
+    session = rest_session(cfg)
     method = "GET"
     body: dict[str, str] | None = None
 
     if len(parts) > 1 and parts[1].strip().startswith("="):
         if not allow_writes:
-            raise RouterOSError(
-                "Write operations are disabled. Set ALLOW_WRITES=true to enable."
-            )
+            msg = "Write operations are disabled. Set ALLOW_WRITES=true to enable."
+            raise RouterOSError(msg)
         method = "POST"
-        body = _parse_ros_kv(parts[1])
+        body = parse_ros_kv(parts[1])
 
     try:
         resp = session.request(method, url, json=body, timeout=(5, 15))
     except requests.exceptions.ConnectionError as exc:
-        raise RouterOSError(
-            f"Cannot reach {cfg['host']}:{cfg['port']}: {exc}"
-        ) from exc
+        msg = f"Cannot reach {cfg['host']}:{cfg['port']}: {exc}"
+        raise RouterOSError(msg) from exc
     except requests.exceptions.Timeout:
-        raise RouterOSError(
-            f"Timeout connecting to {cfg['host']}:{cfg['port']}"
-        ) from None
+        msg = f"Timeout connecting to {cfg['host']}:{cfg['port']}"
+        raise RouterOSError(msg) from None
 
-    if resp.status_code == 401:
-        raise RouterOSError("Authentication failed — check credentials in config.yaml")
+    if resp.status_code == HTTP_UNAUTHORIZED:
+        msg = "Authentication failed — check credentials in config.yaml"
+        raise RouterOSError(msg)
     if not resp.ok:
-        raise RouterOSError(f"API error {resp.status_code}: {resp.text[:200]}")
+        msg = f"API error {resp.status_code}: {resp.text[:200]}"
+        raise RouterOSError(msg)
 
     try:
         formatted = json.dumps(resp.json(), indent=2)
     except ValueError:
         formatted = resp.text
 
-    return formatted[:3950] + "\n… (truncated)" if len(formatted) > 4000 else formatted
+    if len(formatted) > MAX_MESSAGE_LENGTH:
+        return formatted[: MAX_MESSAGE_LENGTH - 50] + "\n… (truncated)"
+    return formatted
 
 
-# ---------------------------------------------------------------------------
-# Transport: RouterOS API via librouteros (RouterOS 3.x+, ports 8728/8729)
-# ---------------------------------------------------------------------------
-
-
-def _routeros_api_connect(cfg: RouterConfig) -> librouteros.Api:
+def routeros_api_connect(cfg: RouterConfig) -> librouteros.Api:
     """Open a librouteros connection to a router."""
-    port: int = cfg["port"]
+    port = int(cast("int", cfg["port"]))
     use_tls: bool = port == ROUTEROS_API_TLS_PORT
 
     try:
         if use_tls:
-            import ssl
             ctx = ssl.create_default_context()
             if not cfg.get("tls_verify", True):
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
             conn = librouteros.connect(
-                cfg["host"],
-                username=cfg["username"],
-                password=cfg["password"],
+                str(cfg["host"]),
+                username=str(cfg["username"]),
+                password=str(cfg["password"]),
                 port=port,
                 ssl_wrapper=ctx.wrap_socket,
             )
         else:
             conn = librouteros.connect(
-                cfg["host"],
-                username=cfg["username"],
-                password=cfg["password"],
+                str(cfg["host"]),
+                username=str(cfg["username"]),
+                password=str(cfg["password"]),
                 port=port,
             )
     except librouteros.exceptions.TrapError as exc:
-        raise RouterOSError(f"Authentication failed: {exc}") from exc
+        msg = f"Authentication failed: {exc}"
+        raise RouterOSError(msg) from exc
     except OSError as exc:
-        raise RouterOSError(f"Cannot reach {cfg['host']}:{port}: {exc}") from exc
+        msg = f"Cannot reach {cfg['host']}:{port}: {exc}"
+        raise RouterOSError(msg) from exc
 
     return conn
 
 
-def _ros_path_to_api(api_path: str) -> tuple[str, ...]:
+def ros_path_to_api(api_path: str) -> tuple[str, ...]:
     """Convert a slash-separated path to a RouterOS API word tuple."""
     parts = [p for p in api_path.strip("/").split("/") if p]
     if not parts:
-        raise RouterOSError("Empty API path")
-    return ("/" + parts[0],) + tuple(parts[1:])
+        msg = "Empty API path"
+        raise RouterOSError(msg)
+    return ("/" + parts[0], *parts[1:])
 
 
 def execute_api(cfg: RouterConfig, raw_command: str) -> str:
@@ -359,39 +365,37 @@ def execute_api(cfg: RouterConfig, raw_command: str) -> str:
     api_path = parts[0].strip("/")
 
     if not re.fullmatch(r"[A-Za-z0-9/_-]+", api_path):
-        raise RouterOSError(f"Invalid API path: {api_path!r}")
+        msg = f"Invalid API path: {api_path!r}"
+        raise RouterOSError(msg)
 
     has_params = len(parts) > 1 and parts[1].strip().startswith("=")
 
     if has_params and not allow_writes:
-        raise RouterOSError(
-            "Write operations are disabled. Set ALLOW_WRITES=true to enable."
-        )
+        msg = "Write operations are disabled. Set ALLOW_WRITES=true to enable."
+        raise RouterOSError(msg)
 
-    conn = _routeros_api_connect(cfg)
+    conn = routeros_api_connect(cfg)
 
     try:
-        path_words = _ros_path_to_api(api_path)
+        path_words = ros_path_to_api(api_path)
         menu = conn.path(*path_words)
 
         if has_params:
-            kwargs = _parse_ros_kv(parts[1])
-            result: list[dict[str, Any]] = list(menu.add(**kwargs))
+            kwargs = parse_ros_kv(parts[1])
+            result = list(menu.add(**kwargs))
         else:
             result = list(menu)
 
         formatted = json.dumps(result, indent=2, default=str)
     except librouteros.exceptions.TrapError as exc:
-        raise RouterOSError(f"RouterOS API trap: {exc}") from exc
+        msg = f"RouterOS API trap: {exc}"
+        raise RouterOSError(msg) from exc
     finally:
         conn.close()
 
-    return formatted[:3950] + "\n… (truncated)" if len(formatted) > 4000 else formatted
-
-
-# ---------------------------------------------------------------------------
-# Transport dispatcher
-# ---------------------------------------------------------------------------
+    if len(formatted) > MAX_MESSAGE_LENGTH:
+        return formatted[: MAX_MESSAGE_LENGTH - 50] + "\n… (truncated)"
+    return formatted
 
 
 def execute_command(cfg: RouterConfig, raw_command: str) -> str:
@@ -401,69 +405,50 @@ def execute_command(cfg: RouterConfig, raw_command: str) -> str:
     return execute_api(cfg, raw_command)
 
 
-# ---------------------------------------------------------------------------
-# Matrix I/O
-# ---------------------------------------------------------------------------
-
-
-def send_matrix_message(text: str, room: str | None = None) -> None:
-    """Send a plain-text message to Matrix via matrix-commander-rs.
-
-    Parameters
-    ----------
-    text:
-        Message body.
-    room:
-        Matrix room ID or alias override.
-    """
-    cmd = [MC_BIN, "--output", "json", "--message", text]
-    if room:
-        cmd += ["--room", room]
-    try:
-        subprocess.run(cmd, check=True, timeout=30, capture_output=True)  # noqa: S603
-    except subprocess.CalledProcessError as exc:
-        log.error(
-            "Failed to send Matrix message: %s",
-            exc.stderr.decode(errors="replace"),
-        )
-    except subprocess.TimeoutExpired:
-        log.error("matrix-commander-rs send timed out")
-
-
-def _parse_event(line: str) -> tuple[str | None, str | None, str | None]:
-    """Extract (room_id, sender, body) from a matrix-commander-rs JSON line.
+def parse_event(line: str) -> tuple[str | None, str | None, str | None]:
+    """Extract (room_id, sender, body) from a matrix-cli JSON line.
 
     Returns (None, None, None) for non-text-message events or parse errors.
     """
     try:
-        obj = json.loads(line)
-    except json.JSONDecodeError:
+        parsed: dict[str, object] | list[object] | str | int | float | bool | None
+        parsed = cast(
+            "dict[str, object] | list[object] | str | int | float | bool | None",
+            json.loads(line),
+        )
+    except json.JSONDecodeError, TypeError:
         return None, None, None
 
-    source = obj.get("source", {})
-    if source.get("type") != "m.room.message":
+    if not isinstance(parsed, dict):
         return None, None, None
-    content = source.get("content", {})
+
+    obj: dict[str, object] = parsed
+
+    if obj.get("status") == "listening":
+        return None, None, None
+
+    if obj.get("type") != "m.room.message":
+        return None, None, None
+    content = cast("dict[str, object]", obj.get("content", {}))
     if content.get("msgtype") != "m.text":
         return None, None, None
 
-    room_id: str | None = obj.get("room_id") or source.get("room_id")
-    sender: str | None = source.get("sender")
-    body: str | None = (content.get("body") or "").strip()
+    raw_room: object = obj.get("room_id")
+    raw_sender: object = obj.get("sender")
+    room_id: str | None = str(raw_room) if raw_room is not None else None
+    sender: str | None = str(raw_sender) if raw_sender is not None else None
+    body: str | None = str(content.get("body") or "").strip()
     return room_id, sender, body
 
 
-# ---------------------------------------------------------------------------
-# Help message
-# ---------------------------------------------------------------------------
-
-
-def _build_help(cfg: BotConfig) -> str:
+def build_help(cfg: BotConfig) -> str:
     """Build the help message dynamically from allowed_commands."""
     routers_list = ", ".join(f"`{r}`" for r in sorted(cfg.routers.keys()))
     commands_list = "\n".join(f"  {c}" for c in sorted(cfg.allowed_commands))
     allow_writes = os.getenv("ALLOW_WRITES", "false").lower() == "true"
-    writes_note = "✅ enabled" if allow_writes else "❌ disabled (set ALLOW_WRITES=true)"
+    writes_note = (
+        "✅ enabled" if allow_writes else "❌ disabled (set ALLOW_WRITES=true)"
+    )
 
     return (
         "**MikroTik Matrix Bot**\n\n"
@@ -478,42 +463,31 @@ def _build_help(cfg: BotConfig) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Command dispatch
-# ---------------------------------------------------------------------------
-
-
-def dispatch(body: str, room_id: str | None, sender: str | None, cfg: BotConfig) -> tuple[str, str | None]:
+def dispatch(
+    body: str, room_id: str | None, sender: str | None, cfg: BotConfig
+) -> tuple[str, str | None]:
     """Parse a Matrix message and return (response, target_room).
 
     Layer 0 — identity, room, and user gates are applied here.
     Returns ("", None) to remain silent.
 
-    Parameters
-    ----------
-    body:
-        Raw message text.
-    room_id:
-        Matrix room ID the message came from.
-    sender:
-        Matrix user ID of the message author.
-    cfg:
-        Full bot configuration.
+    Args:
+        body: Raw message text.
+        room_id: Matrix room ID the message came from.
+        sender: Matrix user ID of the message author.
+        cfg: Full bot configuration.
 
-    Returns
-    -------
-    tuple[str, str | None]
-        (response_text, target_room_id). Empty string means no response.
+    Returns:
+        Tuple of ``(response_text, target_room_id)``. Empty string means
+        no response should be sent.
+
     """
-    # --- Layer 0a: ignore own messages ---
-    if sender == cfg.bot_user:
-        return "", None
+    response: str = ""
+    target_room: str | None = None
 
-    # --- Layer 0b: ignore messages from rooms other than command_room ---
-    if room_id != cfg.command_room:
-        return "", None
+    if sender == cfg.bot_user or room_id != cfg.command_room:
+        return response, target_room
 
-    # --- Layer 0c: unauthorised user ---
     if sender not in cfg.allowed_users:
         log.warning("Unauthorized access attempt from %s in %s", sender, room_id)
         alert = (
@@ -524,106 +498,90 @@ def dispatch(body: str, room_id: str | None, sender: str | None, cfg: BotConfig)
         )
         return alert, cfg.admin_room
 
-    # --- help / start ---
     if body.strip().lower() in ("help", "start", "!mtik help", "!mtik start"):
-        return _build_help(cfg), cfg.command_room
+        return build_help(cfg), cfg.command_room
 
-    # --- Layer 1: regex validation ---
     m = CMD_RE.match(body)
     if not m:
-        return "", None
+        return response, target_room
 
     router_id = m.group("router_id")
     command = m.group("command")
 
-    # --- router lookup ---
     if router_id not in cfg.routers:
         known = ", ".join(f"`{r}`" for r in sorted(cfg.routers.keys()))
-        return f"❌ Unknown router `{router_id}`. Known IDs: {known}", cfg.command_room
+        response = f"❌ Unknown router `{router_id}`. Known IDs: {known}"
+        target_room = cfg.command_room
+    else:
+        api_path = command.strip().split(None, 1)[0].strip("/")
+        if api_path not in cfg.allowed_commands:
+            allowed = "\n".join(f"  {c}" for c in sorted(cfg.allowed_commands))
+            response = (
+                f"❌ Command `{api_path}` is not in the allowed list.\n"
+                f"Allowed commands:\n```\n{allowed}\n```"
+            )
+            target_room = cfg.command_room
+        else:
+            log.info(
+                "Dispatching: sender=%s router=%s command=%r",
+                sender,
+                router_id,
+                command,
+            )
+            try:
+                result = execute_command(cfg.routers[router_id], command)
+            except RouterOSError as exc:
+                log.warning("RouterOSError router=%s: %s", router_id, exc)
+                response = f"❌ Router `{router_id}`: {exc}"
+                target_room = cfg.command_room
+            else:
+                response = f"✅ `{router_id}` → `{command}`\n```\n{result}\n```"
+                target_room = cfg.command_room
 
-    # --- Layer 2: command whitelist ---
-    api_path = command.strip().split(None, 1)[0].strip("/")
-    if api_path not in cfg.allowed_commands:
-        allowed = "\n".join(f"  {c}" for c in sorted(cfg.allowed_commands))
-        return (
-            f"❌ Command `{api_path}` is not in the allowed list.\n"
-            f"Allowed commands:\n```\n{allowed}\n```"
-        ), cfg.command_room
-
-    log.info("Dispatching: sender=%s router=%s command=%r", sender, router_id, command)
-
-    try:
-        result = execute_command(cfg.routers[router_id], command)
-        return f"✅ `{router_id}` → `{command}`\n```\n{result}\n```", cfg.command_room
-    except RouterOSError as exc:
-        log.warning("RouterOSError router=%s: %s", router_id, exc)
-        return f"❌ Router `{router_id}`: {exc}", cfg.command_room
-
-
-# ---------------------------------------------------------------------------
-# Main listen loop
-# ---------------------------------------------------------------------------
+    return response, target_room
 
 
 def listen_loop(cfg: BotConfig) -> NoReturn:
-    """Spawn matrix-commander-rs in listen mode and dispatch events forever."""
+    """Spawn matrix-cli in listen mode and dispatch events forever."""
     backoff = 2
 
     while True:
-        log.info("Starting matrix-commander-rs listener (back-off=%ds)", backoff)
-        cmd = [MC_BIN, "--output", "json", "--listen", "forever"]
-
-        try:
-            proc = subprocess.Popen(  # noqa: S603
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=sys.stderr,
-                text=True,
-                bufsize=1,
-            )
-        except FileNotFoundError:
-            log.critical("%s not found — is the base image correct?", MC_BIN)
-            sys.exit(1)
-
-        log.info("matrix-commander-rs PID %d", proc.pid)
+        log.info("Starting matrix-cli listener (back-off=%ds)", backoff)
+        listener = start_listener()
         backoff = 2
 
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
+        for raw_line in listener.lines:
+            line: str = raw_line
+            stripped = line.strip()
+            if not stripped:
                 continue
-            room_id, sender, body = _parse_event(line)
+            room_id, sender, body = parse_event(stripped)
             if body is None:
                 continue
             log.debug("Event sender=%s room=%s body=%r", sender, room_id, body)
             response, target_room = dispatch(body, room_id, sender, cfg)
             if response:
-                send_matrix_message(response, room=target_room)
+                send_message(response, room=target_room)
 
-        proc.wait()
+        _ = listener.wait()
         log.warning(
-            "matrix-commander-rs exited code=%d — restarting in %ds",
-            proc.returncode,
+            "matrix-cli exited code=%d — restarting in %ds",
+            listener.returncode,
             backoff,
         )
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
 
 
-# ---------------------------------------------------------------------------
-# Signal handling & entry point
-# ---------------------------------------------------------------------------
-
-
-def _handle_sigterm(_signum: int, _frame: Any) -> NoReturn:
+def handle_sigterm(_signum: int, _frame: FrameType | None) -> NoReturn:
+    """Translate ``SIGTERM`` into a clean ``sys.exit(0)`` for graceful shutdown."""
     log.info("SIGTERM received — shutting down")
     sys.exit(0)
 
 
 def main() -> None:
     """Bot entry point."""
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    _ = signal.signal(signal.SIGTERM, handle_sigterm)
     cfg = load_config(CONFIG_PATH)
     listen_loop(cfg)
 
