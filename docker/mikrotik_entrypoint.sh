@@ -22,7 +22,9 @@ BOT_PID=""
 
 cleanup() {
     echo "[entrypoint] Signal received — stopping bot"
-    [ -n "$BOT_PID" ] && kill -TERM "$BOT_PID" 2>/dev/null || true
+    if [ -n "$BOT_PID" ]; then
+        kill -TERM "$BOT_PID" 2>/dev/null || true
+    fi
     wait "$BOT_PID" 2>/dev/null || true
     echo "[entrypoint] Clean exit"
     exit 0
